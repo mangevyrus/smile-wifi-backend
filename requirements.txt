@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic-settings
+httpx
+jinja2
+routeros-api
+alembic
+psycopg2-binary
+python-multipart

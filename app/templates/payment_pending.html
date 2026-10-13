@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="sw">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>SMILE WiFi - Malipo</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f8fc;
+            color: #123;
+        }
+
+        .card {
+            width: min(460px, 92%);
+            margin: 45px auto;
+            background: white;
+            padding: 28px;
+            border-radius: 18px;
+            box-shadow: 0 8px 30px rgba(0, 0, 0, .08);
+            text-align: center;
+        }
+
+        h1 {
+            margin-bottom: 8px;
+        }
+
+        h2 {
+            margin-top: 0;
+            color: #444;
+        }
+
+        .loader {
+            width: 48px;
+            height: 48px;
+            border: 5px solid #dcecf7;
+            border-top-color: #1389d8;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 22px auto;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .amount {
+            font-size: 28px;
+            font-weight: bold;
+            margin: 15px 0;
+        }
+
+        .details {
+            background: #f3f7fa;
+            border-radius: 12px;
+            padding: 15px;
+            text-align: left;
+            margin-top: 20px;
+        }
+
+        .details div {
+            margin: 8px 0;
+        }
+
+        .success {
+            color: #168447;
+            font-weight: bold;
+        }
+
+        .failed {
+            color: #b00020;
+            font-weight: bold;
+        }
+
+        .processing {
+            color: #1389d8;
+            font-weight: bold;
+        }
+
+        .mock {
+            margin-top: 15px;
+            background: #fff4cc;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 13px;
+        }
+
+        #statusMessage {
+            margin-top: 18px;
+            font-weight: bold;
+            line-height: 1.5;
+        }
+
+        .small {
+            margin-top: 15px;
+            color: #667;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="card">
+
+    <h1>SMILE WiFi</h1>
+
+    <h2>Inasubiri Malipo</h2>
+
+    {% if mock_mode %}
+
+        <div class="mock">
+            DEVELOPMENT MODE —
+            hakuna pesa halisi itakayokatwa.
+        </div>
+
+    {% else %}
+
+        <div class="loader"></div>
+
+    {% endif %}
+
+    <div class="amount">
+        TZS {{ "{:,}".format(package.amount) }}
+    </div>
+
+    <div>
+        Kifurushi:
+        <strong>{{ package.name }}</strong>
+    </div>
+
+    <div class="details">
+
+        <div>
+            Mtandao:
+            <strong>{{ network }}</strong>
+        </div>
+
+        <div>
+            Namba:
+            <strong>{{ phone }}</strong>
+        </div>
+
+        <div>
+            Order:
+            <strong>{{ order.order_reference }}</strong>
+        </div>
+
+    </div>
+
+    <div id="statusMessage" class="processing">
+
+        {% if mock_mode %}
+
+            Mock payment inakamilishwa...
+
+        {% else %}
+
+            USSD-PUSH imetumwa.
+            Angalia simu yako na fuata maelekezo
+            ya wallet yako.
+
+        {% endif %}
+
+    </div>
+
+    <div class="small">
+        Usifunge ukurasa huu mpaka malipo
+        yatakapothibitishwa.
+    </div>
+
+</div>
+
+
+<script>
+
+const orderReference = "{{ order.order_reference }}";
+
+const statusMessage =
+    document.getElementById("statusMessage");
+
+
+let attempts = 0;
+
+const maxAttempts = 60;
+
+
+/*
+ * ------------------------------------------------------------
+ * Find MikroTik login URL
+ * ------------------------------------------------------------
+ *
+ * The customer originally came from MikroTik HotSpot.
+ *
+ * We use the gateway login URL.
+ *
+ * If the page was reached from a different hotspot login URL,
+ * the browser can still use this value.
+ */
+
+const hotspotLoginUrl =
+    "http://10.10.10.1/login";
+
+
+/*
+ * ------------------------------------------------------------
+ * Get voucher ticket
+ * ------------------------------------------------------------
+ */
+
+async function getTicket() {
+
+    const response = await fetch(
+        `/ticket/${encodeURIComponent(orderReference)}`,
+        {
+            cache: "no-store"
+        }
+    );
+
+    if (!response.ok) {
+        throw new Error(
+            "Ticket endpoint failed"
+        );
+    }
+
+    return await response.json();
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * Redirect customer back to MikroTik
+ * ------------------------------------------------------------
+ */
+
+function returnToHotspot(ticket) {
+
+    const voucher = ticket.voucher;
+    const packageInfo = ticket.package;
+
+    const params = new URLSearchParams();
+
+    params.set(
+        "payment",
+        "success"
+    );
+
+    params.set(
+        "package",
+        packageInfo.name
+    );
+
+    params.set(
+        "amount",
+        packageInfo.amount
+    );
+
+    params.set(
+        "username",
+        voucher.username
+    );
+
+    params.set(
+        "password",
+        voucher.password
+    );
+
+    params.set(
+        "duration",
+        packageInfo.duration
+    );
+
+    params.set(
+        "expires",
+        ticket.expires || ""
+    );
+
+    params.set(
+        "order",
+        orderReference
+    );
+
+    window.location.href =
+        hotspotLoginUrl +
+        "?" +
+        params.toString();
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * Check payment
+ * ------------------------------------------------------------
+ */
+
+async function checkPayment() {
+
+    attempts++;
+
+    try {
+
+        const response = await fetch(
+            `/payment/status/${encodeURIComponent(orderReference)}`,
+            {
+                cache: "no-store"
+            }
+        );
+
+        const data = await response.json();
+
+        console.log(
+            "Payment status:",
+            data
+        );
+
+
+        /*
+         * SUCCESS
+         */
+
+        if (
+            data.status === "SUCCESS" ||
+            data.status === "SETTLED"
+        ) {
+
+            statusMessage.className =
+                "success";
+
+            statusMessage.innerHTML =
+                "✅ Malipo yamepokelewa." +
+                "<br>" +
+                "Tunatengeneza voucher yako...";
+
+            /*
+             * Give webhook/voucher creation
+             * a short moment if necessary.
+             */
+
+            await new Promise(
+                resolve =>
+                    setTimeout(resolve, 1000)
+            );
+
+
+            try {
+
+                const ticket =
+                    await getTicket();
+
+if (
+    ticket.success === true &&
+    (
+        ticket.voucherStatus === "ACTIVE" ||
+        ticket.voucherStatus === "CREATED"
+    )
+) {
+
+                    statusMessage.innerHTML =
+                        "✅ Voucher imetengenezwa." +
+                        "<br>" +
+                        "Tunarudi kwenye HotSpot...";
+
+
+                    await new Promise(
+                        resolve =>
+                            setTimeout(
+                                resolve,
+                                800
+                            )
+                    );
+
+
+                    returnToHotspot(
+                        ticket
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * Payment succeeded but
+                 * voucher is still pending.
+                 */
+
+                statusMessage.innerHTML =
+                    "✅ Malipo yamepokelewa." +
+                    "<br>" +
+                    "Voucher bado inatengenezwa...";
+
+                if (
+                    attempts < maxAttempts
+                ) {
+
+                    setTimeout(
+                        checkPayment,
+                        3000
+                    );
+
+                }
+
+                return;
+
+            } catch (ticketError) {
+
+                console.error(
+                    ticketError
+                );
+
+                statusMessage.innerHTML =
+                    "Malipo yamepokelewa, " +
+                    "lakini tunasubiri voucher...";
+
+                if (
+                    attempts < maxAttempts
+                ) {
+
+                    setTimeout(
+                        checkPayment,
+                        3000
+                    );
+
+                }
+
+                return;
+            }
+        }
+
+
+        /*
+         * MOCK SUCCESS
+         */
+
+        if (
+            data.status === "MOCK_SUCCESS"
+        ) {
+
+            statusMessage.className =
+                "success";
+
+            statusMessage.innerHTML =
+                "✅ MOCK payment imefanikiwa." +
+                "<br>" +
+                "Tunatengeneza voucher...";
+
+            setTimeout(
+                checkPayment,
+                1000
+            );
+
+            return;
+        }
+
+
+        /*
+         * FAILED
+         */
+
+        if (
+            data.status === "FAILED" ||
+            data.status === "PAYMENT_FAILED"
+        ) {
+
+            statusMessage.className =
+                "failed";
+
+            statusMessage.innerHTML =
+                "❌ Malipo yameshindwa." +
+                "<br>" +
+                (
+                    data.message ||
+                    "Tafadhali jaribu tena."
+                );
+
+            return;
+        }
+
+
+        /*
+         * PROCESSING
+         */
+
+        statusMessage.className =
+            "processing";
+
+        if (
+            attempts >= maxAttempts
+        ) {
+
+            statusMessage.innerHTML =
+                "Malipo bado hayajathibitishwa." +
+                "<br>" +
+                "Tafadhali subiri au jaribu tena.";
+
+            return;
+        }
+
+
+        setTimeout(
+            checkPayment,
+            3000
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+        if (
+            attempts >= maxAttempts
+        ) {
+
+            statusMessage.className =
+                "failed";
+
+            statusMessage.innerHTML =
+                "Hatukuweza kupata hali ya malipo." +
+                "<br>" +
+                "Tafadhali jaribu tena.";
+
+            return;
+        }
+
+
+        setTimeout(
+            checkPayment,
+            3000
+        );
+    }
+}
+
+
+checkPayment();
+
+</script>
+
+</body>
+</html>

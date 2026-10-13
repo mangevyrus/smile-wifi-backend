@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="sw">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>SMILE WiFi - Malipo</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #f3f7fb;
+            font-family: Arial, Helvetica, sans-serif;
+            color: #172033;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 520px;
+            margin: 30px auto;
+        }
+
+        .card {
+            background: white;
+            border-radius: 18px;
+            padding: 25px;
+            box-shadow: 0 10px 35px rgba(0, 0, 0, 0.08);
+        }
+
+        .brand {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .brand h1 {
+            margin: 0;
+            color: #063970;
+            font-size: 28px;
+        }
+
+        .brand p {
+            margin: 7px 0 0;
+            color: #667085;
+        }
+
+        .package {
+            background: #eef7ff;
+            border-radius: 14px;
+            padding: 18px;
+            text-align: center;
+            margin-bottom: 22px;
+        }
+
+        .package-name {
+            font-size: 22px;
+            font-weight: 800;
+            color: #063970;
+        }
+
+        .package-price {
+            margin-top: 8px;
+            font-size: 26px;
+            font-weight: 900;
+            color: #00844a;
+        }
+
+        .package-duration {
+            margin-top: 5px;
+            color: #667085;
+        }
+
+        .error {
+            background: #fff0f0;
+            border: 1px solid #ffb5b5;
+            color: #b42318;
+            padding: 12px;
+            border-radius: 10px;
+            margin-bottom: 18px;
+            text-align: center;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 7px;
+            font-weight: 700;
+        }
+
+        select,
+        input {
+            width: 100%;
+            border: 1px solid #ccd5df;
+            border-radius: 10px;
+            padding: 13px;
+            font-size: 16px;
+            margin-bottom: 17px;
+            outline: none;
+        }
+
+        select:focus,
+        input:focus {
+            border-color: #1473e6;
+        }
+
+        .button {
+            width: 100%;
+            border: 0;
+            border-radius: 11px;
+            padding: 14px;
+            background: #063970;
+            color: white;
+            font-size: 16px;
+            font-weight: 800;
+            cursor: pointer;
+        }
+
+        .button:hover {
+            opacity: 0.92;
+        }
+
+        .back {
+            display: block;
+            text-align: center;
+            margin-top: 18px;
+            color: #063970;
+            text-decoration: none;
+            font-weight: 700;
+        }
+
+        .notice {
+            margin-top: 18px;
+            background: #fff9e8;
+            border-radius: 10px;
+            padding: 12px;
+            color: #795900;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="card">
+
+        <div class="brand">
+            <h1>SMILE WiFi</h1>
+            <p>Lipa kwa simu na upate voucher yako.</p>
+        </div>
+
+        <div class="package">
+
+            <div class="package-name">
+                {{ package.name }}
+            </div>
+
+            <div class="package-price">
+                TZS {{ "{:,}".format(customer_price) }}
+            </div>
+
+            <div class="package-duration">
+                Muda: {{ package.duration }}
+            </div>
+
+        </div>
+
+        {% if error %}
+
+        <div class="error">
+            {{ error }}
+        </div>
+
+        {% endif %}
+
+        <form
+            method="post"
+            action="/checkout/{{ package.code }}/start"
+        >
+
+            <input
+                type="hidden"
+                name="login_url"
+                value="{{ login_url }}"
+            >
+
+            <label for="network">
+                Chagua mtandao wa malipo
+            </label>
+
+            <select
+                id="network"
+                name="network"
+                required
+            >
+
+                <option value="">
+                    -- Chagua mtandao --
+                </option>
+
+                {% for code, name in networks.items() %}
+
+                <option value="{{ code }}">
+                    {{ name }}
+                </option>
+
+                {% endfor %}
+
+            </select>
+
+            <label for="phone">
+                Namba ya simu
+            </label>
+
+            <input
+                id="phone"
+                name="phone"
+                type="tel"
+                placeholder="Mfano: 0712345678"
+                autocomplete="tel"
+                required
+            >
+
+            <button
+                type="submit"
+                class="button"
+            >
+                ENDELEA NA MALIPO
+            </button>
+
+        </form>
+
+        <div class="notice">
+            Baada ya kubonyeza <strong>ENDELEA NA MALIPO</strong>,
+            utapokea ombi la malipo kwenye simu yako.
+            Kamilisha malipo ili voucher yako itengenezwe.
+        </div>
+
+        <a
+            class="back"
+            href="{{ login_url }}"
+        >
+            ← Rudi kwenye SMILE WiFi
+        </a>
+
+    </div>
+
+</div>
+
+</body>
+</html>

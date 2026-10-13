@@ -1,0 +1,120 @@
+from fastapi import APIRouter, Request
+from sqlalchemy.orm import Session
+
+from app.database import SessionLocal
+from app.models.order import Order
+from app.models.payment import Payment
+
+router = APIRouter(
+    prefix="/webhooks",
+    tags=["Webhooks"],
+)
+
+
+@router.post("/clickpesa")
+async def clickpesa_webhook(request: Request):
+
+    payload = await request.json()
+
+    event = payload.get("event")
+    data = payload.get("data", {})
+
+    db: Session = SessionLocal()
+
+    try:
+
+        order_reference = data.get(
+            "orderReference"
+        )
+
+        if not order_reference:
+            return {
+                "success": False,
+                "message": "Missing orderReference"
+            }
+
+        order = (
+            db.query(Order)
+            .filter(
+                Order.order_reference
+                == order_reference
+            )
+            .first()
+        )
+
+        if not order:
+            return {
+                "success": False,
+                "message": "Order not found"
+            }
+
+        payment = (
+            db.query(Payment)
+            .filter(
+                Payment.order_id == order.id
+            )
+            .order_by(Payment.id.desc())
+            .first()
+        )
+
+        if event == "PAYMENT RECEIVED":
+
+            order.status = "PAID"
+
+            if payment:
+
+                payment.status = (
+                    data.get("status")
+                    or "SUCCESS"
+                )
+
+                payment.payment_reference = (
+                    data.get(
+                        "paymentReference"
+                    )
+                )
+
+                payment.raw_response = payload
+
+            db.commit()
+
+            return {
+                "success": True,
+                "message": (
+                    "Payment processed"
+                )
+            }
+
+        elif event == "PAYMENT FAILED":
+
+            order.status = (
+                "PAYMENT_FAILED"
+            )
+
+            if payment:
+
+                payment.status = (
+                    data.get("status")
+                    or "FAILED"
+                )
+
+                payment.raw_response = payload
+
+            db.commit()
+
+            return {
+                "success": True,
+                "message": (
+                    "Failure recorded"
+                )
+            }
+
+        return {
+            "success": True,
+            "message": (
+                f"Ignored event {event}"
+            )
+        }
+
+    finally:
+        db.close()

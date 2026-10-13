@@ -1,0 +1,577 @@
+import hashlib
+import hmac
+import json
+import logging
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.database import SessionLocal
+from app.models.order import Order
+from app.models.payment import Payment
+
+
+router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_phone(phone: str | None) -> str:
+    """
+    Normalize Tanzanian phone numbers to 255XXXXXXXXX format.
+    """
+    if not phone:
+        return ""
+
+    phone = phone.strip().replace(" ", "").replace("-", "")
+
+    if phone.startswith("+255"):
+        return phone[1:]
+
+    if phone.startswith("255"):
+        return phone
+
+    if phone.startswith("0"):
+        return "255" + phone[1:]
+
+    return phone
+
+
+def normalize_currency(currency: str | None) -> str:
+    """
+    Normalize currency values such as 'tzs' -> 'TZS'.
+    """
+    if not currency:
+        return ""
+
+    return currency.strip().upper()
+
+
+def decimal_amount(value) -> Decimal:
+    """
+    Safely convert an amount to Decimal.
+    """
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Invalid amount")
+
+
+def canonicalize_for_checksum(value):
+    """
+    Recursively sort dictionaries before checksum calculation.
+    Lists preserve their order.
+    """
+    if isinstance(value, dict):
+        return {
+            key: canonicalize_for_checksum(value[key])
+            for key in sorted(value.keys())
+            if key not in {"checksum", "checksumMethod"}
+        }
+
+    if isinstance(value, list):
+        return [canonicalize_for_checksum(item) for item in value]
+
+    return value
+
+
+def calculate_checksum(payload: dict, secret_key: str) -> str:
+    """
+    Calculate HMAC-SHA256 checksum.
+
+    ClickPesa checksum calculation excludes:
+      - checksum
+      - checksumMethod
+
+    and recursively sorts JSON object keys.
+    """
+    canonical_payload = canonicalize_for_checksum(payload)
+
+    compact_json = json.dumps(
+        canonical_payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+    digest = hmac.new(
+        secret_key.encode("utf-8"),
+        compact_json.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return digest
+
+
+def verify_checksum(payload: dict) -> None:
+    """
+    Verify ClickPesa checksum when checksum key is configured.
+
+    During development, if no checksum key is configured,
+    we allow the request but log a warning.
+
+    Before production, configure CLICKPESA_CHECKSUM_KEY.
+    """
+    settings = get_settings()
+
+    checksum_key = settings.clickpesa_checksum_key
+
+    if not checksum_key:
+        logger.warning(
+            "CLICKPESA_CHECKSUM_KEY is not configured. "
+            "Webhook checksum verification is currently disabled."
+        )
+        return
+
+    received_checksum = payload.get("checksum")
+
+    if not received_checksum:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing webhook checksum",
+        )
+
+    expected_checksum = calculate_checksum(
+        payload,
+        checksum_key,
+    )
+
+    if not hmac.compare_digest(
+        str(received_checksum).lower(),
+        expected_checksum.lower(),
+    ):
+        logger.warning(
+            "Invalid ClickPesa webhook checksum"
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook checksum",
+        )
+
+
+@router.post("/clickpesa")
+async def clickpesa_webhook(request: Request):
+    """
+    Secure ClickPesa payment webhook.
+
+    Handles:
+      PAYMENT RECEIVED
+      PAYMENT FAILED
+    """
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON payload",
+        )
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook payload",
+        )
+
+    # ---------------------------------------------------------
+    # 1. Verify checksum
+    # ---------------------------------------------------------
+
+    verify_checksum(payload)
+
+    # ---------------------------------------------------------
+    # 2. Extract event
+    # ---------------------------------------------------------
+
+    event = payload.get("event")
+    data = payload.get("data")
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or invalid webhook data",
+        )
+
+    # ---------------------------------------------------------
+    # 3. Only process supported events
+    # ---------------------------------------------------------
+
+    if event not in {
+        "PAYMENT RECEIVED",
+        "PAYMENT FAILED",
+    }:
+        logger.info(
+            "Ignoring unsupported ClickPesa event: %s",
+            event,
+        )
+
+        return {
+            "success": True,
+            "message": f"Ignored event {event}",
+        }
+
+    order_reference = data.get("orderReference")
+
+    if not order_reference:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing orderReference",
+        )
+
+    db: Session = SessionLocal()
+
+    try:
+        # -----------------------------------------------------
+        # 4. Find order
+        # -----------------------------------------------------
+
+        order = (
+            db.query(Order)
+            .filter(
+                Order.order_reference == order_reference
+            )
+            .first()
+        )
+
+        if not order:
+            logger.warning(
+                "Webhook received for unknown order: %s",
+                order_reference,
+            )
+
+            raise HTTPException(
+                status_code=404,
+                detail="Order not found",
+            )
+
+        # -----------------------------------------------------
+        # 5. Find payment belonging to this order
+        # -----------------------------------------------------
+
+        payment = (
+            db.query(Payment)
+            .filter(
+                Payment.order_id == order.id
+            )
+            .order_by(Payment.id.desc())
+            .first()
+        )
+
+        if not payment:
+            logger.warning(
+                "No payment record found for order: %s",
+                order_reference,
+            )
+
+            raise HTTPException(
+                status_code=404,
+                detail="Payment record not found",
+            )
+
+        # =====================================================
+        # PAYMENT RECEIVED
+        # =====================================================
+
+        if event == "PAYMENT RECEIVED":
+
+            # -------------------------------------------------
+            # 6. Verify ClickPesa status
+            # -------------------------------------------------
+
+            webhook_status = str(
+                data.get("status") or ""
+            ).upper()
+
+            if webhook_status != "SUCCESS":
+                logger.warning(
+                    "PAYMENT RECEIVED event with invalid status "
+                    "for %s: %s",
+                    order_reference,
+                    webhook_status,
+                )
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment status is not SUCCESS",
+                )
+
+            # -------------------------------------------------
+            # 7. Payment reference is mandatory
+            # -------------------------------------------------
+
+            payment_reference = data.get(
+                "paymentReference"
+            )
+
+            if not payment_reference:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing paymentReference",
+                )
+
+            # -------------------------------------------------
+            # 8. Duplicate payment-reference protection
+            # -------------------------------------------------
+
+            existing_payment = (
+                db.query(Payment)
+                .filter(
+                    Payment.payment_reference
+                    == payment_reference
+                )
+                .first()
+            )
+
+            if existing_payment:
+                # Same payment reference belongs to this payment.
+                if existing_payment.id == payment.id:
+
+                    logger.info(
+                        "Duplicate ClickPesa webhook ignored: "
+                        "%s",
+                        payment_reference,
+                    )
+
+                    return {
+                        "success": True,
+                        "message": "Payment already processed",
+                    }
+
+                # Same payment reference belongs to another order.
+                logger.error(
+                    "Payment reference %s already belongs "
+                    "to another payment record",
+                    payment_reference,
+                )
+
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payment reference already belongs "
+                           "to another order",
+                )
+
+            # -------------------------------------------------
+            # 9. Verify amount
+            # -------------------------------------------------
+
+            collected_amount = data.get(
+                "collectedAmount"
+            )
+
+            if collected_amount is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing collectedAmount",
+                )
+
+            try:
+                webhook_amount = decimal_amount(
+                    collected_amount
+                )
+
+                order_amount = decimal_amount(
+                    order.amount
+                )
+
+                payment_amount = decimal_amount(
+                    payment.amount
+                )
+
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid payment amount",
+                )
+
+            if webhook_amount != order_amount:
+                logger.error(
+                    "Amount mismatch for %s. "
+                    "Expected=%s Received=%s",
+                    order_reference,
+                    order_amount,
+                    webhook_amount,
+                )
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment amount mismatch",
+                )
+
+            if webhook_amount != payment_amount:
+                logger.error(
+                    "Payment amount mismatch between "
+                    "payment record and webhook for %s",
+                    order_reference,
+                )
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment record amount mismatch",
+                )
+
+            # -------------------------------------------------
+            # 10. Verify currency
+            # -------------------------------------------------
+
+            webhook_currency = normalize_currency(
+                data.get("collectedCurrency")
+            )
+
+            order_currency = normalize_currency(
+                order.currency
+            )
+
+            payment_currency = normalize_currency(
+                payment.currency
+            )
+
+            if not webhook_currency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing collectedCurrency",
+                )
+
+            if webhook_currency != "TZS":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported payment currency",
+                )
+
+            if webhook_currency != order_currency:
+                logger.error(
+                    "Currency mismatch for %s. "
+                    "Order=%s Webhook=%s",
+                    order_reference,
+                    order_currency,
+                    webhook_currency,
+                )
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment currency mismatch",
+                )
+
+            if webhook_currency != payment_currency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment record currency mismatch",
+                )
+
+            # -------------------------------------------------
+            # 11. Verify customer phone when available
+            # -------------------------------------------------
+
+            customer = data.get("customer")
+
+            if isinstance(customer, dict):
+
+                webhook_phone = normalize_phone(
+                    customer.get(
+                        "customerPhoneNumber"
+                    )
+                )
+
+                order_phone = normalize_phone(
+                    order.phone
+                )
+
+                if (
+                    webhook_phone
+                    and order_phone
+                    and webhook_phone != order_phone
+                ):
+                    logger.error(
+                        "Customer phone mismatch for %s. "
+                        "Order=%s Webhook=%s",
+                        order_reference,
+                        order_phone,
+                        webhook_phone,
+                    )
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Customer phone mismatch",
+                    )
+
+            # -------------------------------------------------
+            # 12. Store verified payment information
+            # -------------------------------------------------
+
+            payment.payment_reference = (
+                payment_reference
+            )
+
+            payment.status = "SUCCESS"
+
+            payment.raw_response = payload
+
+            order.status = "PAID"
+
+            order.paid_at = datetime.now(
+                timezone.utc
+            )
+
+            db.commit()
+
+            logger.info(
+                "ClickPesa payment verified successfully: "
+                "order=%s payment=%s amount=%s",
+                order_reference,
+                payment_reference,
+                webhook_amount,
+            )
+
+            return {
+                "success": True,
+                "message": "Payment verified and recorded",
+                "orderReference": order_reference,
+                "status": "PAID",
+            }
+
+        # =====================================================
+        # PAYMENT FAILED
+        # =====================================================
+
+        if event == "PAYMENT FAILED":
+
+            payment.status = "FAILED"
+
+            payment.raw_response = payload
+
+            order.status = "PAYMENT_FAILED"
+
+            db.commit()
+
+            logger.info(
+                "ClickPesa payment failed: %s",
+                order_reference,
+            )
+
+            return {
+                "success": True,
+                "message": "Payment failure recorded",
+                "orderReference": order_reference,
+                "status": "PAYMENT_FAILED",
+            }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Unexpected error processing ClickPesa webhook"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed",
+        )
+
+    finally:
+        db.close()
